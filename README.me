@@ -1,0 +1,149 @@
+Rimac Backend AWS Appointments (Serverless, Node.js, TypeScript)
+
+1) Objetivo
+Backend serverless para agendamiento de citas médicas en Perú y Chile. Crea citas (estado pending), las procesa por paí­s de forma así­ncrona y luego las confirma (completed).
+
+2) Arquitectura (resumen)
+Cliente → API Gateway → Lambda createAppointment
+- DynamoDB PutItem [pending]
+- SNS Publish (countryISO)
+
+SNS → (filtro por countryISO) → SQS-PE → Lambda appointmentPE
+SNS → (filtro por countryISO) → SQS-CL → Lambda appointmentCL
+
+Workers PE/CL →→ Regla → SQS-Confirmations → Lambda appointmentConfirm → DynamoDB UpdateItem [completed]
+
+Incluye DLQs para las colas SQS de paí­ses.
+
+3) Stack
+- AWS: API Gateway (HTTP), Lambda (Node.js 20 + TS), DynamoDB, SNS, SQS (+ DLQs), EventBridge, IAM
+- Infra-as-code: Serverless Framework v4
+- Lenguaje: Node.js + TypeScript
+
+4) Endpoints (OpenAPI)
+Base URL de despliegue:
+https://msp8jya38d.execute-api.us-east-1.amazonaws.com
+
+- POST /appointments
+  Crea una cita en estado pending y dispara el flujo asÃ­ncrono.
+  Request body:
+
+  Respuesta:
+
+
+- GET /appointments/insuredId
+  Lista todas las citas del asegurado (status pending/completed).
+
+5) Requisitos
+- Node.js 18+ (recomendado 20)
+- AWS CLI configurado (aws configure) con permisos para: Lambda, API Gateway, DynamoDB, SNS, SQS, EventBridge, CloudFormation, IAM.
+- Cuenta AWS (región usada: us-east-1)
+
+6) Instalación & Despliegue
+npm i
+npx serverless print > /tmp/sls.out.yml   	; opcional -> validar config
+npm run deploy
+
+Scripts útiles:
+npx serverless logs -f createAppointment -t
+npx serverless logs -f appointmentPE -t
+npx serverless logs -f appointmentCL -t
+npx serverless logs -f appointmentConfirm -t
+
+7) Pruebas rápidas (curl)
+API="https://msp8jya38d.execute-api.us-east-1.amazonaws.com"
+
+# Crear cita Perú
+curl -s -X POST "$API/appointments" -H "content-type: application/json" \
+  -d '"insuredId":"12345","scheduleId":901,"countryISO":"PE"'
+
+# Crear cita Chile
+curl -s -X POST "$API/appointments" -H "content-type: application/json" \
+  -d '"insuredId":"67890","scheduleId":902,"countryISO":"CL"'
+
+# Consultar hasta ver 'completed'
+for i in 1..12; do
+  echo "try $i"
+  curl -s "$API/appointments/12345"
+  curl -s "$API/appointments/67890"
+  sleep 5
+done
+
+8) Variables de entorno (Lambdas)
+- APPOINTMENTS_TABLE(inyectada por Serverless)
+- APPOINTMENTS_TOPIC_ARN(inyectada por Serverless)
+
+Opcional RDS MySQL por paí­s
+- PE_DB_HOST, PE_DB_USER, PE_DB_PASSWORD, PE_DB_NAME
+- CL_DB_HOST, CL_DB_USER, CL_DB_PASSWORD, CL_DB_NAME
+No están definidas, por ello los workers continúan y registran en logs (modo demo).
+
+9) Estructura de proyecto (resumen)
+src/
+  handlers/
+    hello.ts
+    appointment_api.ts        # POST/GET
+    appointment_pe.ts         # worker PE (SQS)
+    appointment_cl.ts         # worker CL (SQS)
+    appointment_confirm.ts    # confirmador (SQS)
+  infrastructure/
+    dynamodb.repository.ts    # acceso a DynamoDB
+    config.ts
+serverless.yml                # IaC (API, colas, topic, reglas, permisos)
+openapi.yaml                  # especificación API
+tests/                        # unit tests mínimos
+
+10) Decisiones técnicas
+- NoSQL con DynamoDB: PK=INSURED#insuredId, SK=APPT#appointmentId permite Query eficiente por asegurado.
+- Fan-out por paí­s: SNS con FilterPolicy → SQS especí­ficas (PE/CL).
+- Desacoplamiento: Workers publican evento de dominio en EventBridge.
+- Resiliencia: SQS con DLQ y reintentos.
+- Serverless Framework: todo como código y reproducible.
+
+11) Mejoras futuras
+- Validación de payload con zod/ajv.
+- CORS para consumo desde frontend.
+- Idempotencia más estricta y observabilidad extra (metrics/tracing).
+- Integración real a RDS MySQL por paí­s si se proveen credenciales.
+
+12) Limpieza
+npm run remove
+
+13) OpenAPI (resumen en YAML)
+
+
+14) Checklist
+- Repositorio público con código, serverless.yml, README.mdy openapi.yaml.
+- URL de despliegue (API Gateway): https://msp8jya38d.execute-api.us-east-1.amazonaws.com
+- Evidencias: resultado de POSTy GET capturas de logs de appointmentPE, appointmentCL, appointmentConfirm.
+
+## Evidencias de Ejecución
+
+Base URL: `https://msp8jya38d.execute-api.us-east-1.amazonaws.com`
+
+## 1) Crear (PE)
+```bash
+API="https://msp8jya38d.execute-api.us-east-1.amazonaws.com"
+curl -s -X POST "$API/appointments" -H "content-type: application/json"   -d '{"insuredId":"12345","scheduleId":901,"countryISO":"PE"}'
+```
+**Respuesta (ejemplo):**
+```json
+{ "appointmentId": "xxxx-xxxx-xxxx-xxxx", "status": "pending" }
+```
+
+## 2) Crear (CL)
+```bash
+curl -s -X POST "$API/appointments" -H "content-type: application/json"   -d '{"insuredId":"67890","scheduleId":902,"countryISO":"CL"}'
+```
+
+## 3) Verificación (polling)
+```bash
+for i in {1..12}; do
+  echo "try $i"
+  curl -s "$API/appointments/12345"
+  curl -s "$API/appointments/67890"
+  sleep 5
+done
+```
+**Esperado:** Los registros recientes cambian de `pending` a `completed`.
+

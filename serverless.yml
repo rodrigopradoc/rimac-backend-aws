@@ -1,0 +1,235 @@
+service: rimac-backend-aws
+frameworkVersion: "4"
+
+provider:
+  name: aws
+  runtime: nodejs20.x
+  region: us-east-1
+  stage: ${opt:stage, 'dev'}
+  environment:
+    APPOINTMENTS_TABLE: ${self:service}-${self:provider.stage}-appointments
+    APPOINTMENTS_TOPIC_ARN:
+      Ref: AppointmentsTopic
+  iam:
+    role:
+      statements:
+        # DynamoDB CRUD básico
+        - Effect: Allow
+          Action:
+            - dynamodb:PutItem
+            - dynamodb:Query
+            - dynamodb:UpdateItem
+          Resource:
+            - Fn::GetAtt: [AppointmentsTable, Arn]
+            - Fn::Join:
+                - "/"
+                - - Fn::GetAtt: [AppointmentsTable, Arn]
+                  - index
+                  - "*"
+        # Publicar a SNS desde el POST
+        - Effect: Allow
+          Action: [ sns:Publish ]
+          Resource:
+            Ref: AppointmentsTopic
+        # Workers publican eventos a EventBridge
+        - Effect: Allow
+          Action: [ events:PutEvents ]
+          Resource: "*"
+
+functions:
+  # Sanity
+  hello:
+    handler: src/handlers/hello.handler
+    events:
+      - httpApi:
+          path: /hello
+          method: get
+
+  # API
+  createAppointment:
+    handler: src/handlers/appointment_api.create
+    events:
+      - httpApi:
+          path: /appointments
+          method: post
+
+  listAppointments:
+    handler: src/handlers/appointment_api.listByInsured
+    events:
+      - httpApi:
+          path: /appointments/{insuredId}
+          method: get
+
+  # Workers por país (SQS)
+  appointmentPE:
+    handler: src/handlers/appointment_pe.handler
+    events:
+      - sqs:
+          arn: { Fn::GetAtt: [QueuePE, Arn] }
+          batchSize: 5
+
+  appointmentCL:
+    handler: src/handlers/appointment_cl.handler
+    events:
+      - sqs:
+          arn: { Fn::GetAtt: [QueueCL, Arn] }
+          batchSize: 5
+
+  # Confirmador (SQS)
+  appointmentConfirm:
+    handler: src/handlers/appointment_confirm.handler
+    events:
+      - sqs:
+          arn: { Fn::GetAtt: [ConfirmationsQueue, Arn] }
+          batchSize: 5
+
+resources:
+  Resources:
+    # DynamoDB
+    AppointmentsTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:provider.environment.APPOINTMENTS_TABLE}
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - { AttributeName: PK, AttributeType: S }
+          - { AttributeName: SK, AttributeType: S }
+        KeySchema:
+          - { AttributeName: PK, KeyType: HASH }
+          - { AttributeName: SK, KeyType: RANGE }
+
+    # SNS Topic
+    AppointmentsTopic:
+      Type: AWS::SNS::Topic
+      Properties:
+        TopicName: ${self:service}-${self:provider.stage}-appointments-topic
+
+    # SQS por país + DLQs
+    DLQPE:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:service}-${self:provider.stage}-dlq-pe
+
+    QueuePE:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:service}-${self:provider.stage}-queue-pe
+        RedrivePolicy:
+          deadLetterTargetArn:
+            Fn::GetAtt: [DLQPE, Arn]
+          maxReceiveCount: 5
+
+    DLQCL:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:service}-${self:provider.stage}-dlq-cl
+
+    QueueCL:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:service}-${self:provider.stage}-queue-cl
+        RedrivePolicy:
+          deadLetterTargetArn:
+            Fn::GetAtt: [DLQCL, Arn]
+          maxReceiveCount: 5
+
+    # Suscripciones SNS -> SQS con filtro y raw delivery
+    SubPE:
+      Type: AWS::SNS::Subscription
+      Properties:
+        TopicArn:
+          Ref: AppointmentsTopic
+        Protocol: sqs
+        Endpoint:
+          Fn::GetAtt: [QueuePE, Arn]
+        RawMessageDelivery: true
+        FilterPolicy:
+          countryISO:
+            - "PE"
+
+    SubCL:
+      Type: AWS::SNS::Subscription
+      Properties:
+        TopicArn:
+          Ref: AppointmentsTopic
+        Protocol: sqs
+        Endpoint:
+          Fn::GetAtt: [QueueCL, Arn]
+        RawMessageDelivery: true
+        FilterPolicy:
+          countryISO:
+            - "CL"
+
+    # Permitir a SNS enviar a SQS
+    QueuePEPolicy:
+      Type: AWS::SQS::QueuePolicy
+      Properties:
+        Queues:
+          - Ref: QueuePE
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service: sns.amazonaws.com
+              Action: sqs:SendMessage
+              Resource:
+                Fn::GetAtt: [QueuePE, Arn]
+              Condition:
+                ArnEquals:
+                  aws:SourceArn:
+                    Ref: AppointmentsTopic
+
+    QueueCLPolicy:
+      Type: AWS::SQS::QueuePolicy
+      Properties:
+        Queues:
+          - Ref: QueueCL
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service: sns.amazonaws.com
+              Action: sqs:SendMessage
+              Resource:
+                Fn::GetAtt: [QueueCL, Arn]
+              Condition:
+                ArnEquals:
+                  aws:SourceArn:
+                    Ref: AppointmentsTopic
+
+    # EventBridge -> SQS de confirmaciones
+    ConfirmationsQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:service}-${self:provider.stage}-queue-confirmations
+
+    EventRuleAppointmentBooked:
+      Type: AWS::Events::Rule
+      Properties:
+        Name: ${self:service}-${self:provider.stage}-rule-appointment-booked
+        EventPattern:
+          source:
+            - "appointments.country"
+          detail-type:
+            - "AppointmentBooked"
+        Targets:
+          - Id: sendToConfirmationsQueue
+            Arn:
+              Fn::GetAtt: [ConfirmationsQueue, Arn]
+
+    ConfirmationsQueuePolicy:
+      Type: AWS::SQS::QueuePolicy
+      Properties:
+        Queues:
+          - Ref: ConfirmationsQueue
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service: events.amazonaws.com
+              Action: sqs:SendMessage
+              Resource:
+                Fn::GetAtt: [ConfirmationsQueue, Arn]

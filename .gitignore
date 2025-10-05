@@ -1,0 +1,16 @@
+node_modules/
+
+dist/
+coverage/
+.cache/
+
+.serverless/
+.aws-sam/
+cdk.out/
+
+.DS_Store
+.vscode/
+.idea/
+
+npm-debug.log*
+yarn-error.log*
